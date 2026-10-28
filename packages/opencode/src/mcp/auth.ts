@@ -1,13 +1,18 @@
+import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import path from "path"
+import { serviceUse } from "@opencode-ai/core/effect/service-use"
 import { Global } from "@opencode-ai/core/global"
 import { Effect, Layer, Context, Option, Schema } from "effect"
-import { AppFileSystem } from "@opencode-ai/core/filesystem"
+import { FSUtil } from "@opencode-ai/core/fs-util"
+import { EffectFlock } from "@opencode-ai/core/util/effect-flock"
+import * as Invalidation from "../kilocode/mcp/invalidation" // kilocode_change
 
 export const Tokens = Schema.Struct({
   accessToken: Schema.mutableKey(Schema.String),
   refreshToken: Schema.mutableKey(Schema.optional(Schema.String)),
   expiresAt: Schema.mutableKey(Schema.optional(Schema.Number)),
   scope: Schema.mutableKey(Schema.optional(Schema.String)),
+  issuer: Schema.mutableKey(Schema.optional(Schema.String)), // kilocode_change - authorization server the MCP SDK bound these to
 })
 export type Tokens = Schema.Schema.Type<typeof Tokens>
 
@@ -16,6 +21,7 @@ export const ClientInfo = Schema.Struct({
   clientSecret: Schema.mutableKey(Schema.optional(Schema.String)),
   clientIdIssuedAt: Schema.mutableKey(Schema.optional(Schema.Number)),
   clientSecretExpiresAt: Schema.mutableKey(Schema.optional(Schema.Number)),
+  issuer: Schema.mutableKey(Schema.optional(Schema.String)), // kilocode_change - authorization server the MCP SDK bound this to
 })
 export type ClientInfo = Schema.Schema.Type<typeof ClientInfo>
 
@@ -32,6 +38,7 @@ const decodeAuthData = Schema.decodeUnknownOption(Schema.Record(Schema.String, E
 type AuthData = Record<string, Entry>
 
 const filepath = path.join(Global.Path.data, "mcp-auth.json")
+const lockKey = `mcp-auth:${filepath}`
 
 export interface Interface {
   readonly all: () => Effect.Effect<Record<string, Entry>>
@@ -46,22 +53,56 @@ export interface Interface {
   readonly updateOAuthState: (mcpName: string, oauthState: string) => Effect.Effect<void>
   readonly getOAuthState: (mcpName: string) => Effect.Effect<string | undefined>
   readonly clearOAuthState: (mcpName: string) => Effect.Effect<void>
-  readonly isTokenExpired: (mcpName: string) => Effect.Effect<boolean | null>
+  // kilocode_change start - atomic conditional automatic invalidation
+  readonly invalidate: (
+    mcpName: string,
+    type: "tokens" | "client",
+    expected: Invalidation.Expected,
+  ) => Effect.Effect<Invalidation.Outcome>
+  // kilocode_change end
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/McpAuth") {}
 
-export const layer = Layer.effect(
+export const use = serviceUse(Service)
+
+const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
-    const fs = yield* AppFileSystem.Service
+    const fs = yield* FSUtil.Service
+    const flock = yield* EffectFlock.Service
 
-    const all = Effect.fn("McpAuth.all")(function* () {
+    const read = Effect.fn("McpAuth.read")(function* () {
       return yield* fs.readJson(filepath).pipe(
         Effect.map((data): AuthData => Option.getOrElse(decodeAuthData(data), () => ({}) as AuthData) as AuthData),
         Effect.catch(() => Effect.succeed({} as AuthData)),
       )
     })
+
+    const all = Effect.fn("McpAuth.all")(function* () {
+      return yield* read().pipe(flock.withLock(lockKey), Effect.orDie)
+    })
+
+    const mutate = Effect.fn("McpAuth.mutate")(function* (update: (data: AuthData) => AuthData | undefined) {
+      yield* Effect.gen(function* () {
+        const next = update(yield* read())
+        if (!next) return
+        yield* fs.writeJson(filepath, next, 0o600).pipe(Effect.orDie)
+      }).pipe(flock.withLock(lockKey), Effect.orDie)
+    })
+
+    // kilocode_change start - read/modify/write with an atomic outcome, so automatic OAuth
+    // invalidation can compare the stored credential and clear it under one lock acquisition
+    const mutateWith = Effect.fn("McpAuth.mutateWith")(function* <A>(
+      update: (data: AuthData) => { next?: AuthData; result: A },
+    ) {
+      return yield* Effect.gen(function* () {
+        const { next, result } = update(yield* read())
+        if (next) yield* fs.writeJson(filepath, next, 0o600).pipe(Effect.orDie)
+        return result
+      }).pipe(flock.withLock(lockKey), Effect.orDie)
+    })
+    // kilocode_change end
 
     const get = Effect.fn("McpAuth.get")(function* (mcpName: string) {
       const data = yield* all()
@@ -77,31 +118,38 @@ export const layer = Layer.effect(
     })
 
     const set = Effect.fn("McpAuth.set")(function* (mcpName: string, entry: Entry, serverUrl?: string) {
-      const data = yield* all()
-      if (serverUrl) entry.serverUrl = serverUrl
-      yield* fs.writeJson(filepath, { ...data, [mcpName]: entry }, 0o600).pipe(Effect.orDie)
+      yield* mutate((data) => ({
+        ...data,
+        [mcpName]: serverUrl ? { ...entry, serverUrl } : entry,
+      }))
     })
 
     const remove = Effect.fn("McpAuth.remove")(function* (mcpName: string) {
-      const data = yield* all()
-      delete data[mcpName]
-      yield* fs.writeJson(filepath, data, 0o600).pipe(Effect.orDie)
+      yield* mutate((data) => {
+        const next = { ...data }
+        delete next[mcpName]
+        return next
+      })
     })
 
     const updateField = <K extends keyof Entry>(field: K, spanName: string) =>
       Effect.fn(`McpAuth.${spanName}`)(function* (mcpName: string, value: NonNullable<Entry[K]>, serverUrl?: string) {
-        const entry = (yield* get(mcpName)) ?? {}
-        entry[field] = value
-        yield* set(mcpName, entry, serverUrl)
+        yield* mutate((data) => {
+          const entry = data[mcpName] ?? {}
+          entry[field] = value
+          if (serverUrl) entry.serverUrl = serverUrl
+          return { ...data, [mcpName]: entry }
+        })
       })
 
     const clearField = (field: keyof Entry, spanName: string) =>
       Effect.fn(`McpAuth.${spanName}`)(function* (mcpName: string) {
-        const entry = yield* get(mcpName)
-        if (entry) {
+        yield* mutate((data) => {
+          const entry = data[mcpName]
+          if (!entry) return undefined
           delete entry[field]
-          yield* set(mcpName, entry)
-        }
+          return { ...data, [mcpName]: entry }
+        })
       })
 
     const updateTokens = updateField("tokens", "updateTokens")
@@ -116,12 +164,24 @@ export const layer = Layer.effect(
       return entry?.oauthState
     })
 
-    const isTokenExpired = Effect.fn("McpAuth.isTokenExpired")(function* (mcpName: string) {
-      const entry = yield* get(mcpName)
-      if (!entry?.tokens) return null
-      if (!entry.tokens.expiresAt) return false
-      return entry.tokens.expiresAt < Date.now() / 1000
+    // kilocode_change start - conditional automatic invalidation bound to the exact rejected
+    // credential. Clears the requested fields only when the stored entry still holds that
+    // credential, so a concurrent rotation that already saved newer tokens is never wiped.
+    const invalidate = Effect.fn("McpAuth.invalidate")(function* (
+      mcpName: string,
+      type: "tokens" | "client",
+      expected: Invalidation.Expected,
+    ) {
+      return yield* mutateWith<Invalidation.Outcome>((data) => {
+        const entry = data[mcpName]
+        if (!entry || !Invalidation.matches(entry, expected, type)) {
+          return { result: { _tag: entry ? "superseded" : "missing" } as Invalidation.Outcome }
+        }
+        const next = Invalidation.clear(entry, type)
+        return { next: { ...data, [mcpName]: next }, result: { _tag: "cleared", entry: next } as Invalidation.Outcome }
+      })
     })
+    // kilocode_change end
 
     return Service.of({
       all,
@@ -136,11 +196,11 @@ export const layer = Layer.effect(
       updateOAuthState,
       getOAuthState,
       clearOAuthState,
-      isTokenExpired,
+      invalidate, // kilocode_change
     })
   }),
 )
 
-export const defaultLayer = layer.pipe(Layer.provide(AppFileSystem.defaultLayer))
+export const node = LayerNode.make({ service: Service, layer: layer, deps: [FSUtil.node, EffectFlock.node] })
 
 export * as McpAuth from "./auth"

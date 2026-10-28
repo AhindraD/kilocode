@@ -4,17 +4,11 @@ import { HttpBody, HttpClient, HttpClientRequest, HttpServerRequest, HttpServerR
 import * as Socket from "effect/unstable/socket/Socket"
 import { WebSocketTracker } from "../websocket-tracker"
 
-function webSource(request: HttpServerRequest.HttpServerRequest): Request | undefined {
-  return request.source instanceof Request ? request.source : undefined
-}
-
 function requestBody(request: HttpServerRequest.HttpServerRequest) {
   if (request.method === "GET" || request.method === "HEAD") return HttpBody.empty
+  if (request.source instanceof Request && request.source.body === null) return HttpBody.empty
   const len = request.headers["content-length"]
-  return HttpBody.raw(webSource(request)?.body ?? null, {
-    contentType: request.headers["content-type"],
-    contentLength: len ? Number(len) : undefined,
-  })
+  return HttpBody.stream(request.stream, request.headers["content-type"], len ? Number(len) : undefined)
 }
 
 export function websocket(
@@ -102,6 +96,39 @@ export function http(
     const headers = new Headers(response.headers as HeadersInit)
     headers.delete("content-encoding")
     headers.delete("content-length")
+
+    // An upstream 5xx from a remote workspace sandbox arrives here as an opaque
+    // status — its real cause (and log line) live only inside the sandbox. Buffer
+    // the small error body, log it locally so it shows up in the host's log, and
+    // forward it unchanged (preserving content-type so the client can still parse
+    // the structured error, e.g. its `ref`).
+    if (response.status >= 500) {
+      // kilocode_change start
+      const body = yield* response.stream.pipe(
+        Stream.decodeText(),
+        Stream.runFold(() => "", (acc: string, str: string) => {
+          const needed = 65536 - acc.length
+          return needed > 0 ? acc + (str.length > needed ? str.slice(0, needed) : str) : acc
+        }),
+        Effect.catch(() => Effect.succeed("")),
+      )
+      const contentType =
+        response.headers["content-type"] ?? (body.trim().startsWith("{") ? "application/json" : "text/plain")
+      // kilocode_change end
+      headers.delete("content-type")
+      yield* Effect.logError("workspace proxy upstream error", {
+        url: url.toString(),
+        method: request.method,
+        status: response.status,
+        body: body.slice(0, 2000),
+      })
+      return HttpServerResponse.text(body, {
+        status: response.status,
+        statusText: statusText(response),
+        headers,
+        contentType,
+      })
+    }
 
     return HttpServerResponse.stream(response.stream.pipe(Stream.catchCause(() => Stream.empty)), {
       status: response.status,

@@ -11,6 +11,7 @@ import type {
   GlobalHealthResponse,
   GlobalEvent,
   KiloEmbeddingModelCatalog,
+  KiloProfileResponse,
   LspStatusResponse,
   McpStatusResponse,
   Pty as PtyInfo,
@@ -41,6 +42,8 @@ export type Query = {
 }
 
 export type ProjectQuery = Pick<Query, "url" | "dir">
+
+export type KiloProfileData = KiloProfileResponse
 
 export type ProjectItem = KiloProject
 export type RecentProjectItem = ProjectItem & {
@@ -208,6 +211,11 @@ function model(input: unknown) {
   const index = input.indexOf("/")
   if (index <= 0 || index >= input.length - 1) return undefined
   return { provider: input.slice(0, index), model: input.slice(index + 1) }
+}
+
+function directory(input: ProjectQuery) {
+  const dir = value(input.dir)
+  return dir ? { directory: dir } : undefined
 }
 
 function title(input: string) {
@@ -407,6 +415,42 @@ export async function loadEmbeddingModels(input: Query): Promise<KiloEmbeddingMo
   return demand("Kilo embedding models", await client(input).indexing.models())
 }
 
+export async function loadKiloProfile(input: ProjectQuery): Promise<KiloProfileData> {
+  const sdk = client(input)
+  const result = await sdk.kilo.profile(directory(input))
+  return demand("Kilo profile", result)
+}
+
+export async function setKiloOrganization(input: ProjectQuery, organizationId: string | null) {
+  const sdk = client(input)
+  const result = await sdk.kilo.organization.set({ ...directory(input), organizationId })
+  demand("Switch Kilo account", result)
+  await sdk.global.dispose()
+}
+
+export async function logoutKilo(input: ProjectQuery) {
+  const sdk = client(input)
+  const result = await sdk.auth.remove({ providerID: "kilo" })
+  demand("Log out of Kilo", result)
+  await sdk.global.dispose()
+}
+
+export async function startKiloLogin(input: ProjectQuery): Promise<ProviderAuthAuthorization> {
+  const sdk = client(input)
+  const result = await sdk.provider.oauth.authorize({ ...directory(input), providerID: "kilo", method: 0 })
+  return demand("Start Kilo login", result)
+}
+
+export async function completeKiloLogin(input: ProjectQuery, signal?: AbortSignal) {
+  const sdk = client(input)
+  const result = await sdk.provider.oauth.callback(
+    { ...directory(input), providerID: "kilo", method: 0 },
+    signal ? { signal } : undefined,
+  )
+  demand("Complete Kilo login", result)
+  await sdk.global.dispose()
+}
+
 export async function loadProjects(input: ProjectQuery): Promise<ProjectItem[]> {
   const sdk = client(input)
   const dir = value(input.dir)
@@ -534,6 +578,11 @@ export type ProjectLiveStatus = {
   attention: boolean
 }
 
+/** A session asleep on a pending wakeup reports `scheduled`; it is not a running turn. */
+export function running(status: SessionStatus) {
+  return status.type === "busy" || status.type === "retry" || status.type === "offline"
+}
+
 export async function loadProjectLiveStatus(input: ProjectQuery, dir: string): Promise<ProjectLiveStatus> {
   const sdk = client({ url: input.url, dir })
   const [status, terminals, permissions, questions] = await Promise.all([
@@ -543,7 +592,7 @@ export async function loadProjectLiveStatus(input: ProjectQuery, dir: string): P
     maybe("Pending questions", sdk.question.list({ directory: dir })),
   ])
   const open = opened(terminals ?? [])
-  const busy = Object.entries(status ?? {}).some(([id, s]) => open.has(id) && s.type !== "idle")
+  const busy = Object.entries(status ?? {}).some(([id, s]) => open.has(id) && running(s))
   const attention = requested(permissions ?? [], open) || requested(questions ?? [], open)
   return { busy, attention }
 }
@@ -584,9 +633,14 @@ export async function removeProjectPty(input: Query, pty: string) {
   return demand("Remove terminal", result)
 }
 
-export async function viewProjectSessions(input: ProjectQuery, focused: string[], open: string[]) {
+export async function viewProjectSessions(
+  input: ProjectQuery,
+  viewer: { id: string; active: boolean },
+  attached: string[],
+  visible: string[],
+) {
   const sdk = client(input)
-  const result = await sdk.session.viewed({ directory: input.dir, focused, open })
+  const result = await sdk.session.viewed({ directory: input.dir, viewer, attached, visible })
   return demand("Viewed sessions", result)
 }
 

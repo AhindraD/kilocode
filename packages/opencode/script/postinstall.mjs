@@ -137,6 +137,23 @@ function copyResources(source) {
     fs.rmSync(target, { recursive: true, force: true })
     fs.cpSync(dir, target, { recursive: true })
   }
+
+  const bwrap = path.join(path.dirname(source), "bwrap")
+  if (fs.existsSync(bwrap)) {
+    const target = path.join(__dirname, "bin", "bwrap")
+    fs.copyFileSync(bwrap, target)
+    fs.chmodSync(target, 0o755)
+  }
+
+  const licenses = path.join(path.dirname(source), "licenses")
+  if (fs.existsSync(licenses)) {
+    const target = path.join(__dirname, "bin", "licenses")
+    fs.rmSync(target, { recursive: true, force: true })
+    fs.cpSync(licenses, target, { recursive: true })
+  }
+
+  const worker = path.join(path.dirname(source), "kilo-sandbox-mutation-worker.js")
+  if (fs.existsSync(worker)) fs.copyFileSync(worker, path.join(__dirname, "bin", "kilo-sandbox-mutation-worker.js"))
 }
 
 function copyBinary(source) {
@@ -190,11 +207,13 @@ function main() {
     }
   }
 
+  // kilocode_change start
   throw new Error(
     `It seems your package manager failed to install the right Kilo CLI package. Try manually installing ${packageNames()
       .map((name) => JSON.stringify(name))
-      .join(" or ")}.`,
+      .join(" or ")}. Or download the pre-built binary from the GitHub Releases page.`,
   )
+// kilocode_change end
 }
 
 try {

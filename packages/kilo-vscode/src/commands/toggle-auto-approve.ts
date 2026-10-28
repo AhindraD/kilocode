@@ -1,5 +1,7 @@
 import * as vscode from "vscode"
-import type { KiloClient } from "@kilocode/sdk/v2/client"
+import type { Event, KiloClient } from "@kilocode/sdk/v2/client"
+import { replyOnce } from "../kilo-provider/handlers/permission-handler"
+import { retry } from "../services/cli-backend/retry"
 import type { KiloConnectionService } from "../services/cli-backend/connection-service"
 
 /**
@@ -13,9 +15,11 @@ export type DirectoryResolver = (sessionId?: string) => string
  * (workspace root + all registered worktree paths).
  */
 export type AllDirectories = () => string[]
+type Asked = Extract<Event, { type: "permission.asked" }>
 
 export interface AutoApproveController {
   active(): boolean
+  approve(event: Asked, directory?: string): Promise<boolean>
   toggle(): Promise<boolean>
   onChange(listener: (active: boolean) => void): { dispose(): void }
 }
@@ -26,9 +30,9 @@ const KEY = "enabled"
 /**
  * Runtime auto-accept toggle for permissions.
  *
- * Instead of writing to the config file, we intercept `permission.asked` SSE
- * events and auto-reply "once" to each. This avoids config-layer issues
- * (merged vs global, sparse defaults) and works even when the sidebar is closed.
+ * Instead of writing to the CLI config, the attention coordinator delegates
+ * `permission.asked` events here and auto-replies "once". This avoids config-layer
+ * issues (merged vs global, sparse defaults) and works even when the sidebar is closed.
  */
 export function registerToggleAutoApprove(
   context: vscode.ExtensionContext,
@@ -61,19 +65,18 @@ export function registerToggleAutoApprove(
       return active
     }
 
-    vscode.window.showInformationMessage("Auto-approve enabled")
+    vscode.window.showInformationMessage("Auto-approve enabled. Sandbox escalation prompts are excluded.")
     // Drain any already-pending permission requests across all tracked directories
     const client = tryGetClient(connectionService)
     if (!client) return active
     for (const dir of directories()) {
       if (generation !== snapshot) break
       try {
-        const { data: pending } = await client.permission.list({ directory: dir }, { throwOnError: true })
+        const { data: pending } = await retry(() => client.permission.list({ directory: dir }, { throwOnError: true }))
         for (const req of pending) {
           if (generation !== snapshot) break
-          await client.permission.reply({ requestID: req.id, directory: dir, reply: "once" }).catch((err) => {
-            console.error("[Kilo New] toggleAutoApprove: failed to drain pending:", err)
-          })
+          if (req.metadata?.["sandboxEscalation"] === true) continue
+          await replyOnce(client, req.id, dir, () => generation === snapshot)
         }
       } catch (err) {
         console.error("[Kilo New] toggleAutoApprove: failed to list pending permissions:", err)
@@ -83,19 +86,16 @@ export function registerToggleAutoApprove(
     return active
   }
 
-  const unsubscribe = connectionService.onEvent((event, directory) => {
-    if (!active) return
-    if (event.type !== "permission.asked") return
+  const approve = async (event: Asked, directory?: string) => {
+    if (!active) return false
     const client = tryGetClient(connectionService)
-    if (!client) return
+    if (!client) return false
+    if (event.properties.metadata?.["sandboxEscalation"] === true) return false
     const dir =
       directory ?? connectionService.getPermissionDirectory(event.properties.id) ?? resolve(event.properties.sessionID)
-    client.permission.reply({ requestID: event.properties.id, directory: dir, reply: "once" }).catch((err) => {
-      console.error("[Kilo New] toggleAutoApprove: failed to auto-reply:", err)
-    })
-  })
+    return replyOnce(client, event.properties.id, dir)
+  }
 
-  context.subscriptions.push({ dispose: unsubscribe })
   context.subscriptions.push(
     vscode.workspace.onDidChangeConfiguration((event) => {
       if (!event.affectsConfiguration(`${CONFIG}.${KEY}`)) return
@@ -111,6 +111,7 @@ export function registerToggleAutoApprove(
 
   return {
     active: () => active,
+    approve,
     toggle,
     onChange(listener) {
       listeners.add(listener)

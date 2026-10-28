@@ -1,35 +1,65 @@
 import { describe, expect } from "bun:test"
 import { ConfigProvider, Effect, Layer } from "effect"
+import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { RuntimeFlags } from "../../src/effect/runtime-flags"
 import { it } from "../lib/effect"
 
 const fromConfig = (input: Record<string, unknown>) =>
-  RuntimeFlags.defaultLayer.pipe(Layer.provide(ConfigProvider.layer(ConfigProvider.fromUnknown(input))))
+  AppNodeBuilder.build(RuntimeFlags.node).pipe(Layer.provide(ConfigProvider.layer(ConfigProvider.fromUnknown(input))))
 
 const readFlags = RuntimeFlags.Service.useSync((flags) => flags)
 
 describe("RuntimeFlags", () => {
-  it.effect("defaultLayer defaults autoShare to false", () =>
+  it.effect("layer defaults autoShare to false", () =>
     Effect.gen(function* () {
       const flags = yield* readFlags.pipe(Effect.provide(fromConfig({})))
 
       expect(flags.autoShare).toBe(false)
+      expect(flags.experimentalBackgroundSubagents).toBe(true) // kilocode_change
     }),
   )
 
-  it.effect("defaultLayer parses plugin flags from the active ConfigProvider", () =>
+  // kilocode_change start - preserve the background-subagent kill switch
+  it.effect("allows disabling background subagents explicitly", () =>
+    Effect.gen(function* () {
+      const flags = yield* readFlags.pipe(
+        Effect.provide(fromConfig({ KILO_EXPERIMENTAL_BACKGROUND_SUBAGENTS: "false" })),
+      )
+
+      expect(flags.experimentalBackgroundSubagents).toBe(false)
+    }),
+  )
+  // kilocode_change end
+
+  // kilocode_change start - shared agent board defaults on with a kill switch
+  it.effect("enables the shared agent board by default", () =>
+    Effect.gen(function* () {
+      const flags = yield* readFlags.pipe(Effect.provide(fromConfig({})))
+
+      expect(flags.experimentalSharedAgentBoard).toBe(true)
+    }),
+  )
+
+  it.effect("allows disabling the shared agent board explicitly", () =>
+    Effect.gen(function* () {
+      const flags = yield* readFlags.pipe(Effect.provide(fromConfig({ KILO_EXPERIMENTAL_SHARED_AGENT_BOARD: "false" })))
+
+      expect(flags.experimentalSharedAgentBoard).toBe(false)
+    }),
+  )
+  // kilocode_change end
+
+  it.effect("layer parses plugin flags from the active ConfigProvider", () =>
     Effect.gen(function* () {
       const flags = yield* readFlags.pipe(
         Effect.provide(
           fromConfig({
             KILO_PURE: "true",
             KILO_DISABLE_DEFAULT_PLUGINS: "true",
-            KILO_DISABLE_CHANNEL_DB: "true",
             KILO_AUTO_SHARE: "true",
             KILO_DISABLE_EMBEDDED_WEB_UI: "true",
             KILO_DISABLE_EXTERNAL_SKILLS: "true",
             KILO_DISABLE_LSP_DOWNLOAD: "true",
-            KILO_SKIP_MIGRATIONS: "true",
             KILO_EXPERIMENTAL: "true",
             KILO_ENABLE_EXA: "true",
             KILO_ENABLE_PARALLEL: "true",
@@ -43,30 +73,29 @@ describe("RuntimeFlags", () => {
       expect(flags.pure).toBe(true)
       expect(flags.autoShare).toBe(true)
       expect(flags.disableDefaultPlugins).toBe(true)
-      expect(flags.disableChannelDb).toBe(true)
       expect(flags.disableEmbeddedWebUi).toBe(true)
       expect(flags.disableExternalSkills).toBe(true)
       expect(flags.disableLspDownload).toBe(true)
-      expect(flags.skipMigrations).toBe(true)
       expect(flags.disableClaudeCodePrompt).toBe(false)
       expect(flags.enableExa).toBe(true)
       expect(flags.enableParallel).toBe(true)
       expect(flags.enableExperimentalModels).toBe(true)
       expect(flags.enableQuestionTool).toBe(true)
-      expect(flags.experimentalScout).toBe(true)
-      expect(flags.experimentalBackgroundSubagents).toBe(true)
+      expect(flags.experimentalReferences).toBe(true)
       expect(flags.experimentalLspTy).toBe(false)
       expect(flags.experimentalLspTool).toBe(true)
+      expect(flags.experimentalContextTools).toBe(true) // kilocode_change
       expect(flags.experimentalOxfmt).toBe(true)
-      expect(flags.experimentalPlanMode).toBe(true)
       expect(flags.experimentalEventSystem).toBe(true)
       expect(flags.experimentalWorkspaces).toBe(true)
       expect(flags.experimentalIconDiscovery).toBe(true)
+      expect(flags.experimentalNativeLlm).toBe(false)
+      expect(flags.experimentalWebSockets).toBe(false)
       expect(flags.client).toBe("desktop")
     }),
   )
 
-  it.effect("defaultLayer parses KILO_EXPERIMENTAL_LSP_TY", () =>
+  it.effect("layer parses KILO_EXPERIMENTAL_LSP_TY", () =>
     Effect.gen(function* () {
       const flags = yield* readFlags.pipe(
         Effect.provide(
@@ -80,6 +109,26 @@ describe("RuntimeFlags", () => {
     }),
   )
 
+  it.effect("enables native LLM via dedicated flag only", () =>
+    Effect.gen(function* () {
+      const explicit = yield* readFlags.pipe(Effect.provide(fromConfig({ KILO_EXPERIMENTAL_NATIVE_LLM: "true" })))
+      const umbrella = yield* readFlags.pipe(Effect.provide(fromConfig({ KILO_EXPERIMENTAL: "true" })))
+
+      expect(explicit.experimentalNativeLlm).toBe(true)
+      expect(umbrella.experimentalNativeLlm).toBe(false)
+    }),
+  )
+
+  it.effect("enables WebSockets via dedicated flag only", () =>
+    Effect.gen(function* () {
+      const explicit = yield* readFlags.pipe(Effect.provide(fromConfig({ KILO_EXPERIMENTAL_WEBSOCKETS: "true" })))
+      const umbrella = yield* readFlags.pipe(Effect.provide(fromConfig({ KILO_EXPERIMENTAL: "true" })))
+
+      expect(explicit.experimentalWebSockets).toBe(true)
+      expect(umbrella.experimentalWebSockets).toBe(false)
+    }),
+  )
+
   it.effect("layer accepts partial test overrides and fills defaults from Config definitions", () =>
     Effect.gen(function* () {
       const flags = yield* readFlags.pipe(
@@ -89,11 +138,9 @@ describe("RuntimeFlags", () => {
       expect(flags.pure).toBe(false)
       expect(flags.autoShare).toBe(false)
       expect(flags.disableDefaultPlugins).toBe(true)
-      expect(flags.disableChannelDb).toBe(false)
       expect(flags.disableEmbeddedWebUi).toBe(false)
       expect(flags.disableExternalSkills).toBe(false)
       expect(flags.disableLspDownload).toBe(false)
-      expect(flags.skipMigrations).toBe(false)
       expect(flags.disableClaudeCodePrompt).toBe(false)
       expect(flags.disableClaudeCodeSkills).toBe(false)
       expect(flags.enableExa).toBe(false)
@@ -146,22 +193,6 @@ describe("RuntimeFlags", () => {
     }),
   )
 
-  it.effect("skipMigrations defaults to false", () =>
-    Effect.gen(function* () {
-      const flags = yield* readFlags.pipe(Effect.provide(fromConfig({})))
-
-      expect(flags.skipMigrations).toBe(false)
-    }),
-  )
-
-  it.effect("skipMigrations reads KILO_SKIP_MIGRATIONS", () =>
-    Effect.gen(function* () {
-      const flags = yield* readFlags.pipe(Effect.provide(fromConfig({ KILO_SKIP_MIGRATIONS: "true" })))
-
-      expect(flags.skipMigrations).toBe(true)
-    }),
-  )
-
   it.effect("disableClaudeCodePrompt defaults to false", () =>
     Effect.gen(function* () {
       const flags = yield* readFlags.pipe(Effect.provide(fromConfig({})))
@@ -202,6 +233,21 @@ describe("RuntimeFlags", () => {
     }),
   )
 
+  it.effect("specific experimental flags override KILO_EXPERIMENTAL", () =>
+    Effect.gen(function* () {
+      const flags = yield* readFlags.pipe(
+        Effect.provide(
+          fromConfig({
+            KILO_EXPERIMENTAL: "true",
+            KILO_EXPERIMENTAL_ICON_DISCOVERY: "false",
+          }),
+        ),
+      )
+
+      expect(flags.experimentalIconDiscovery).toBe(false)
+    }),
+  )
+
   it.effect("experimentalOxfmt defaults to false", () =>
     Effect.gen(function* () {
       const flags = yield* readFlags.pipe(Effect.provide(fromConfig({})))
@@ -237,6 +283,31 @@ describe("RuntimeFlags", () => {
       expect(flags.experimentalOxfmt).toBe(true)
     }),
   )
+
+  // kilocode_change start - self-context tools
+  it.effect("experimentalContextTools defaults to false", () =>
+    Effect.gen(function* () {
+      const flags = yield* readFlags.pipe(Effect.provide(fromConfig({})))
+
+      expect(flags.experimentalContextTools).toBe(false)
+    }),
+  )
+
+  it.effect("experimentalContextTools is disabled by an explicit false override", () =>
+    Effect.gen(function* () {
+      const flags = yield* readFlags.pipe(
+        Effect.provide(
+          fromConfig({
+            KILO_EXPERIMENTAL: "true",
+            KILO_EXPERIMENTAL_CONTEXT_TOOLS: "false",
+          }),
+        ),
+      )
+
+      expect(flags.experimentalContextTools).toBe(false)
+    }),
+  )
+  // kilocode_change end
 
   for (const input of [
     { name: "absent", config: {}, expected: undefined },
@@ -307,7 +378,6 @@ describe("RuntimeFlags", () => {
               KILO_DISABLE_DEFAULT_PLUGINS: "true",
               KILO_DISABLE_EXTERNAL_SKILLS: "true",
               KILO_DISABLE_LSP_DOWNLOAD: "true",
-              KILO_SKIP_MIGRATIONS: "true",
               KILO_EXPERIMENTAL: "true",
               KILO_ENABLE_EXA: "true",
               KILO_EXPERIMENTAL_BASH_DEFAULT_TIMEOUT_MS: "1234",
@@ -319,11 +389,9 @@ describe("RuntimeFlags", () => {
 
       expect(flags.pure).toBe(false)
       expect(flags.disableDefaultPlugins).toBe(false)
-      expect(flags.disableChannelDb).toBe(false)
       expect(flags.disableEmbeddedWebUi).toBe(false)
       expect(flags.disableExternalSkills).toBe(false)
       expect(flags.disableLspDownload).toBe(false)
-      expect(flags.skipMigrations).toBe(false)
       expect(flags.disableClaudeCodePrompt).toBe(false)
       expect(flags.disableClaudeCodeSkills).toBe(false)
       expect(flags.enableExa).toBe(false)

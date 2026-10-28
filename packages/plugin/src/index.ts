@@ -176,6 +176,7 @@ export type AuthOAuthResult = { url: string; instructions: string } & (
                 expires: number
                 accountId?: string
                 enterpriseUrl?: string
+                baseURL?: string
               }
             | { key: string; metadata?: Record<string, string> }
           ))
@@ -197,6 +198,7 @@ export type AuthOAuthResult = { url: string; instructions: string } & (
                 expires: number
                 accountId?: string
                 enterpriseUrl?: string
+                baseURL?: string
               }
             | { key: string; metadata?: Record<string, string> }
           ))
@@ -220,6 +222,7 @@ export type ProviderHook = {
 export type AuthOuathResult = AuthOAuthResult
 
 export interface Hooks {
+  dispose?: () => Promise<void>
   event?: (input: { event: Event }) => Promise<void>
   config?: (input: Config) => Promise<void>
   tool?: {
@@ -293,6 +296,7 @@ export interface Hooks {
       system: string[]
     },
   ) => Promise<void>
+  "experimental.provider.small_model"?: (input: { provider: ProviderV2 }, output: { model?: ModelV2 }) => Promise<void>
   /**
    * Called before session compaction starts. Allows plugins to customize
    * the compaction prompt.
